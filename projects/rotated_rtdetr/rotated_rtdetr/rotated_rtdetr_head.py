@@ -9,6 +9,7 @@ from mmrotate.structures.bbox import rbbox_overlaps
 from projects.rotated_dino.rotated_dino import RotatedDINOHead
 from .varifocal_loss import VarifocalLoss
 from .prob_iou import probiou
+from .utils import cast_tensors_to_float, disable_autocast, find_device_type
 
 
 class RotatedRTDETRHead(RotatedDINOHead):
@@ -54,6 +55,30 @@ class RotatedRTDETRHead(RotatedDINOHead):
               last dimension arranged as (cx, cy, w, h).
         """
         return tuple(references)
+
+    def loss_by_feat(self, *args, **kwargs) -> Dict[str, Tensor]:
+        """Loss function, always computed in float32 with autocast disabled.
+
+        Under AMP (fp16 / bf16) the predictions come out of the decoder in
+        half precision, which breaks the loss computation:
+
+        - The varifocal IoU targets are written into a float32 tensor via
+          index_put, which fails when the IoU is half precision.
+        - The Hungarian matching costs (GDCost / ChamferCost) and the
+          GDLoss (KLD) build covariance matrices from pixel-scale boxes with
+          ``bmm``. Autocast re-casts ``bmm`` to half even for float32 inputs,
+          so the covariances overflow (fp16 max is 65504) and produce
+          inf / NaN costs and losses.
+
+        Casting the inputs to float32 and disabling autocast here makes the
+        whole loss (matching, targets and all loss terms) run in float32,
+        while gradients still flow back to the half precision activations.
+        """
+        args = cast_tensors_to_float(args)
+        kwargs = cast_tensors_to_float(kwargs)
+        device_type = find_device_type((args, kwargs)) or 'cuda'
+        with disable_autocast(device_type):
+            return super().loss_by_feat(*args, **kwargs)
 
     @staticmethod
     def split_outputs(all_layers_cls_scores: List[Tensor],

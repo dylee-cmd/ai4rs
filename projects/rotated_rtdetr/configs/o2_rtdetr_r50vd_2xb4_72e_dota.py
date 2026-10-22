@@ -1,7 +1,7 @@
 from torch.optim.adamw import AdamW
 from mmengine.config import read_base
 from mmengine.runner.loops import EpochBasedTrainLoop, TestLoop, ValLoop
-from mmengine.optim.optimizer import OptimWrapper
+from mmengine.optim.optimizer import AmpOptimWrapper
 from mmengine.optim.scheduler.lr_scheduler import LinearLR
 from mmengine.hooks.ema_hook import EMAHook
 from mmdet.models.data_preprocessors import DetDataPreprocessor
@@ -146,8 +146,15 @@ model = dict(
 
 
 # optimizer
+# Automatic mixed precision. The loss (matching, targets and all loss terms)
+# and the deformable attention sampling are kept in float32 inside the model,
+# so only the backbone / neck / transformer matmuls run in half precision.
+# - dtype='float16': works on any CUDA GPU, uses dynamic loss scaling.
+# - dtype='bfloat16': needs Ampere or newer (A100, RTX 30xx/40xx, H100, ...).
 optim_wrapper = dict(
-    type=OptimWrapper,
+    type=AmpOptimWrapper,
+    dtype='bfloat16',
+    loss_scale='dynamic',
     optimizer=dict(type=AdamW, lr=0.0001, weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(

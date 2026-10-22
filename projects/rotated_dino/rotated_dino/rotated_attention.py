@@ -114,6 +114,12 @@ class RotatedMultiScaleDeformableAttention(MultiScaleDeformableAttention):
             raise ValueError(
                 f'Last dim of reference_points must be'
                 f' 2, 4, or 5, but get {reference_points.shape[-1]} instead.')
+        # Run the sampling in float32 under AMP: the CUDA kernel has no
+        # bf16 support and half precision sampling locations lose sub-pixel
+        # accuracy. This is a no-op when training in float32.
+        value = value.float()
+        sampling_locations = sampling_locations.float()
+        attention_weights = attention_weights.float()
         if ((IS_CUDA_AVAILABLE and value.is_cuda)
                 or (IS_MLU_AVAILABLE and value.is_mlu)):
             output = MultiScaleDeformableAttnFunction.apply(
