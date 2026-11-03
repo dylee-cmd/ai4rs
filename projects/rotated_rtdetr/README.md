@@ -164,6 +164,39 @@ python demo/image_demo.py \
     --out-file /root/demo_result.jpg
 ```
 
+## Class Activation Maps (Grad-CAM)
+
+Based on the [pytorch-grad-cam object detection tutorial](https://jacobgil.github.io/pytorch-gradcam-book/Class%20Activation%20Maps%20for%20Object%20Detection%20With%20Faster%20RCNN.html) (`pip install grad-cam`).
+
+```bash
+python projects/rotated_rtdetr/tools/rtdetr_cam.py \
+    demo/dota_demo.jpg \
+    projects/rotated_rtdetr/configs/o2_rtdetr_r50vd_2xb4_72e_dota.py \
+    your_path/epoch_72.pth \
+    --method gradcam --target-layer encoder --score-thr 0.3 \
+    --out-file /root/cam_result.jpg
+```
+
+- `--method`: `gradcam`, `gradcam++`, `xgradcam`, `hirescam`, `layercam`, `eigengradcam`, `eigencam`, `ablationcam`
+  (for `ablationcam`, `--ratio-channels-to-ablate 0.1` makes it ~10x faster).
+  Plain `gradcam` averages the gradients over the whole feature map and tends to highlight object borders and surroundings on this detector; `hirescam`, `layercam`, `eigencam` and `ablationcam` usually localize the objects themselves better.
+- `--target-layer`: multi-level features to explain, `encoder` (hybrid encoder output, the memory the decoder attends to), `neck` or `backbone`.
+- `--renormalize`: re-normalize the CAM inside every rotated box, zero outside.
+- The CAM target is the sum over detections (score >= `--score-thr`) of `probiou + score` of the best matching output box of the same class (`RotatedBoxScoreTarget`).
+
+To use it from Python, see `projects/rotated_rtdetr/rotated_rtdetr/cam.py` (`RotatedRTDETRCAMModel`, `RotatedBoxScoreTarget`, `AblationLayerRotatedRTDETR`):
+
+```python
+from pytorch_grad_cam import GradCAM
+from projects.rotated_rtdetr.rotated_rtdetr.cam import (
+    RotatedBoxScoreTarget, RotatedRTDETRCAMModel)
+
+cam_model = RotatedRTDETRCAMModel(detector, target_layer='encoder').eval()
+cam = GradCAM(cam_model, [cam_model.cam_tap],
+              reshape_transform=cam_model.reshape_transform)
+grayscale_cam = cam(inputs, targets=[RotatedBoxScoreTarget(labels, bboxes)])[0]
+```
+
 ## Params, FLOPs and MACs
 ```bash
 PYTHONPATH=. python tools/analysis_tools/get_flops/get_flops.py \
