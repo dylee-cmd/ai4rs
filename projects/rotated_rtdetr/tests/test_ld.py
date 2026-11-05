@@ -19,7 +19,8 @@ from mmrotate.structures.bbox import RotatedBoxes
 from projects.rotated_rtdetr.rotated_rtdetr import (Integral,
                                                     RotatedRTDETRKD)
 from projects.rotated_rtdetr.rotated_rtdetr.rotated_rtdetr_ld import (
-    distribution_kl_div, generate_shared_dn_queries, shift_distribution)
+    distribution_kl_div, generate_shared_dn_queries, shift_distribution,
+    soften)
 
 CFG = 'projects/rotated_rtdetr/configs/'
 SIZE = 128
@@ -82,23 +83,44 @@ def test_shift_distribution():
     torch.manual_seed(0)
     prob = torch.rand(6, 17).softmax(-1)
     # no shift: identity
-    torch.testing.assert_close(
-        shift_distribution(prob, torch.zeros(6), 4.0), prob)
+    out, mass = shift_distribution(prob, torch.zeros(6), 4.0)
+    torch.testing.assert_close(out, prob)
+    torch.testing.assert_close(mass, torch.ones(6))
     # half a bin: one hot splits in two
     one_hot = torch.zeros(1, 17)
     one_hot[0, 8] = 1
-    out = shift_distribution(one_hot, torch.tensor([0.25]), 4.0)
+    out, _ = shift_distribution(one_hot, torch.tensor([0.25]), 4.0)
     torch.testing.assert_close(out[0, 8:10], torch.tensor([0.5, 0.5]))
     # mass is kept and the expectation moves by the shift
     bins = torch.linspace(-4, 4, 17)
     centered = torch.exp(-(bins - 0.3)**2)[None].repeat(3, 1)
     centered = centered / centered.sum(-1, keepdim=True)
     shift = torch.tensor([-0.7, 0.1, 0.55])
-    out = shift_distribution(centered, shift, 4.0)
+    out, mass = shift_distribution(centered, shift, 4.0)
     torch.testing.assert_close(out.sum(-1), torch.ones(3))
+    torch.testing.assert_close(mass, torch.ones(3), atol=1e-4, rtol=0)
     torch.testing.assert_close((out * bins).sum(-1),
                                (centered * bins).sum(-1) + shift,
                                atol=2e-3, rtol=0)
+
+
+def test_shift_drops_mass_out_of_range():
+    # mass split over the two edge bins, shifted outwards by one bin: the
+    # outer half leaves the range and is dropped, not piled up on the edge
+    prob = torch.zeros(1, 17)
+    prob[0, 15:] = 0.5
+    out, mass = shift_distribution(prob, torch.tensor([0.5]), 4.0)
+    torch.testing.assert_close(mass, torch.tensor([0.5]))
+    torch.testing.assert_close(out[0, 16], torch.tensor(1.0))
+    _, mass = shift_distribution(prob, torch.tensor([10.0]), 4.0)
+    assert float(mass) == 0
+
+
+def test_soften_is_temperature():
+    torch.manual_seed(0)
+    logits = torch.randn(4, 33)
+    torch.testing.assert_close(
+        soften(logits.softmax(-1), 5), (logits / 5).softmax(-1))
 
 
 def test_distribution_kl_matches_mmdet_kd_loss():

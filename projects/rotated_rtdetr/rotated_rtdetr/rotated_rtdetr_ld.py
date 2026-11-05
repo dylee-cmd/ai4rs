@@ -106,28 +106,47 @@ def generate_shared_dn_queries(generators: List[nn.Module],
     return outputs
 
 
-def shift_distribution(prob: Tensor, shift: Tensor, reg_range: float) -> Tensor:
+def shift_distribution(prob: Tensor, shift: Tensor,
+                       reg_range: float) -> Tuple[Tensor, Tensor]:
     """Move a distribution over evenly spaced bins by ``shift`` (values).
 
     Every bin's mass is moved to ``bin + shift`` and split linearly between
-    the two nearest bins (as GFL builds its distribution targets), clamped to
-    the bin range.
+    the two nearest bins (as GFL builds its distribution targets). Mass that
+    lands outside the bin range is dropped, not piled up on the edge bins
+    (an edge one-hot target would push the student's deltas to the limits).
 
     Args:
         prob (Tensor): (N, reg_max + 1) probabilities.
         shift (Tensor): (N, ) shift in value units.
         reg_range (float): Bins span ``[-reg_range, reg_range]``.
+
+    Returns:
+        tuple[Tensor]: The shifted distribution, renormalized, (N, reg_max +
+        1) and the mass that stayed inside the range (N, ).
     """
     reg_max = prob.size(1) - 1
     step = 2 * reg_range / reg_max
     pos = (torch.arange(reg_max + 1, device=prob.device, dtype=prob.dtype)
-           + shift[:, None] / step).clamp(0, reg_max)
+           + shift[:, None] / step)
+    inside = (pos >= 0) & (pos <= reg_max)
+    prob = prob * inside
+    pos = pos.clamp(0, reg_max)
     left = pos.floor().long().clamp(max=reg_max - 1)
     w_right = pos - left
     out = torch.zeros_like(prob)
     out.scatter_add_(1, left, prob * (1 - w_right))
     out.scatter_add_(1, left + 1, prob * w_right)
-    return out
+    mass = out.sum(1)
+    return out / mass.clamp(min=1e-12)[:, None], mass
+
+
+def soften(prob: Tensor, T: float) -> Tensor:
+    """Temperature on probabilities: softmax(log(prob) / T).
+
+    For ``prob = softmax(logits)`` this is ``softmax(logits / T)``.
+    """
+    out = prob.pow(1.0 / T)
+    return out / out.sum(-1, keepdim=True).clamp(min=1e-12)
 
 
 def distribution_kl_div(pred: Tensor, target_prob: Tensor, T: float) -> Tensor:
@@ -249,7 +268,10 @@ class RotatedRTDETRLDHead(RotatedRTDETRHead):
                 'distribution LD needs distribution heads in both models'
             bins = self.reg_max + 1
             T = self.loss_ld.T
-            t_prob = (teacher_refs[2][-1].reshape(-1, bins) / T).softmax(-1)
+            # shift the sharp (T = 1) distribution, soften it afterwards:
+            # a softened one spreads over the whole range and much of it
+            # would fall out when shifted
+            t_prob = teacher_refs[2][-1].reshape(-1, bins).softmax(-1)
             t_ref = teacher_refs[3][-1].reshape(-1)
         else:
             img_h, img_w = batch_img_metas[0]['img_shape']
@@ -271,11 +293,14 @@ class RotatedRTDETRLDHead(RotatedRTDETRHead):
                 # teacher distribution, moved into this layer's frame:
                 # teacher value = t_ref + d = s_ref + (d + t_ref - s_ref)
                 s_ref = student_refs[3][lid].reshape(-1)
-                target = shift_distribution(t_prob, t_ref - s_ref,
-                                            self.reg_range)
+                target, mass = shift_distribution(t_prob, t_ref - s_ref,
+                                                  self.reg_range)
                 loss = distribution_kl_div(
-                    student_refs[2][lid].reshape(-1, bins), target, T)
-                w = ld_w[:, None].expand(-1, self.reg_dim).reshape(-1)
+                    student_refs[2][lid].reshape(-1, bins),
+                    soften(target, T), T)
+                # coordinates the student cannot represent (teacher value
+                # out of its bin range) are not distilled
+                w = ld_w[:, None].expand(-1, self.reg_dim).reshape(-1) * mass
                 # summed over the 5 coordinates, averaged over the region,
                 # as Rotated-LD
                 losses[f'{prefix}loss_ld'] = self.loss_ld.loss_weight * (
