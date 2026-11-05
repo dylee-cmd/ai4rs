@@ -30,6 +30,7 @@ model.bbox_head.update(
         tau=1,
         sqrt=False,
         loss_weight=2.0),
-    loss_kd=dict(type=KnowledgeDistillationKLDivLoss, loss_weight=15, T=5),
+    loss_kd=dict(type=KnowledgeDistillationKLDivLoss, loss_weight=3, T=5),
     vlr_iou_thr=0.4,
+    matching_ld_weight='score',
     distill_all_layers=True)

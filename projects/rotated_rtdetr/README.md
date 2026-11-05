@@ -184,6 +184,11 @@ bash tools/dist_train.sh projects/rotated_rtdetr/configs/o2_rtdetr_r18vd_ld_r50v
 bash tools/dist_train.sh projects/rotated_rtdetr/configs/o2_rtdetr_r18vd_ld_gauss_r50vd_2xb4_72e_dota.py 2
 ```
 
+Differences from Rotated-LD worth knowing:
+- With one-to-one matching only the teacher query matched to an object learned its box (its duplicates get no box loss, unlike the positive anchors of a dense head), so LD on the matching queries is weighted by the teacher's score (`matching_ld_weight='score'`).
+- The loss weights are 3 instead of Rotated-LD's 15 (tuned for one RetinaNet head; here every decoder layer is distilled). With 15, AP75 dropped below the non-distilled baseline in our small synthetic experiments.
+- In distribution LD the teacher distribution is shifted into the student's reference frame (the references of the two decoders differ) before the temperature is applied; mass falling outside the bin range is dropped.
+
 The trained student is a plain O2-RTDETR (the teacher is not saved in the checkpoint): test it with the student architecture config, `o2_rtdetr_r18vd_2xb4_72e_dota.py` (Gaussian LD) or `o2_rtdetr_r18vd_dist_2xb4_72e_dota.py` (distribution LD), so the teacher is not built.
 
 ## Class Activation Maps (Grad-CAM)

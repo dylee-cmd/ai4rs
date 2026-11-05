@@ -23,8 +23,11 @@ model.update(
 model.bbox_head.update(
     type=RotatedRTDETRLDHead,
     ld_mode='distribution',
-    # same as Rotated-LD
-    loss_ld=dict(type=KnowledgeDistillationKLDivLoss, loss_weight=15, T=5),
-    loss_kd=dict(type=KnowledgeDistillationKLDivLoss, loss_weight=15, T=5),
+    # T as Rotated-LD. Its loss weights (15, for a single RetinaNet head)
+    # were too strong here (distilled per decoder layer over many queries):
+    # lower AP75 than without distillation in our experiments; 3 helped.
+    loss_ld=dict(type=KnowledgeDistillationKLDivLoss, loss_weight=3, T=5),
+    loss_kd=dict(type=KnowledgeDistillationKLDivLoss, loss_weight=3, T=5),
     vlr_iou_thr=0.4,
+    matching_ld_weight='score',
     distill_all_layers=True)

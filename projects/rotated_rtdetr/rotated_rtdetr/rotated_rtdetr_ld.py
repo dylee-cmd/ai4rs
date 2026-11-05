@@ -21,7 +21,8 @@ in 1-to-1 correspondence instead:
 
 Valuable localization region: positive denoising queries for LD and all
 denoising queries for KD; for the matching queries, those whose teacher box
-overlaps a GT with rotated IoU >= ``vlr_iou_thr`` (LD and KD).
+overlaps a GT with rotated IoU >= ``vlr_iou_thr`` (LD and KD), LD weighted
+by the teacher's score by default (``matching_ld_weight``).
 
 Two LD modes:
 
@@ -173,6 +174,13 @@ class RotatedRTDETRLDHead(RotatedRTDETRHead):
         ld_mode (str): ``'distribution'`` or ``'gaussian'``.
         vlr_iou_thr (float): Matching queries whose teacher box has a rotated
             IoU >= this with a GT form the valuable localization region.
+        matching_ld_weight (str): Weight of LD on the matching queries in the
+            region. ``'score'``: the teacher's classification score. With
+            one-to-one matching only the teacher query matched to an object
+            learned its box (its duplicates get no box loss), unlike the
+            anchors of a dense head, so this distills mostly those. ``'one'``:
+            every query of the region equally. Denoising queries always have
+            weight 1 (all positive ones are supervised).
         distill_all_layers (bool): Distill every student decoder layer (each
             from the teacher's last layer) or only the last one.
     """
@@ -183,6 +191,7 @@ class RotatedRTDETRLDHead(RotatedRTDETRHead):
                  loss_kd: dict,
                  ld_mode: str = 'distribution',
                  vlr_iou_thr: float = 0.4,
+                 matching_ld_weight: str = 'score',
                  distill_all_layers: bool = True,
                  **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -194,9 +203,12 @@ class RotatedRTDETRLDHead(RotatedRTDETRHead):
         self.loss_ld = MODELS.build(loss_ld)
         self.loss_kd = MODELS.build(loss_kd)
         self.vlr_iou_thr = vlr_iou_thr
+        assert matching_ld_weight in ('score', 'one')
+        self.matching_ld_weight = matching_ld_weight
         self.distill_all_layers = distill_all_layers
 
-    def get_distill_regions(self, teacher_bboxes: Tensor,
+    def get_distill_regions(self, teacher_scores: Tensor,
+                            teacher_bboxes: Tensor,
                             batch_gt_instances: InstanceList,
                             batch_img_metas: List[dict],
                             dn_meta: Dict[str, int]) -> Tuple[Tensor]:
@@ -225,7 +237,11 @@ class RotatedRTDETRLDHead(RotatedRTDETRHead):
                 ious = rbbox_overlaps(teacher_bboxes[i, num_dn:] * factor,
                                       gt.bboxes.tensor.float())
                 vlr = (ious.max(1)[0] >= self.vlr_iou_thr).float()
-                ld_region[i, num_dn:] = vlr
+                if self.matching_ld_weight == 'score':
+                    ld_region[i, num_dn:] = vlr * teacher_scores[
+                        i, num_dn:].sigmoid().max(-1)[0]
+                else:
+                    ld_region[i, num_dn:] = vlr
                 kd_region[i, num_dn:] = vlr
         return ld_region, kd_region
 
@@ -258,7 +274,7 @@ class RotatedRTDETRLDHead(RotatedRTDETRHead):
         assert t_cls.shape == student_refs[0][-1].shape, \
             'teacher and student must have the same queries and classes'
         ld_region, kd_region = self.get_distill_regions(
-            t_box, batch_gt_instances, batch_img_metas, dn_meta)
+            t_cls, t_box, batch_gt_instances, batch_img_metas, dn_meta)
         ld_num = reduce_mean(ld_region.sum()).clamp(min=1).item()
         kd_num = reduce_mean(kd_region.sum()).clamp(min=1).item()
         ld_w, kd_w = ld_region.flatten(), kd_region.flatten()
