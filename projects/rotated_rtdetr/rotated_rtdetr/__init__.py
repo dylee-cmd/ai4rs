@@ -3,8 +3,9 @@ from .hgnetv2 import HGNetV2
 from .rotated_rtdetr import RotatedRTDETR
 from .rtdetr_layers import RTDETRFPN, RTDETRHybridEncoder
 from .varifocal_loss import RTDETRVarifocalLoss, DEIMMalLoss
-from .rotated_rtdetr_head import RotatedRTDETRHead
+from .rotated_rtdetr_head import Integral, RotatedRTDETRHead
 from .rotated_rtdetr_layers import RotatedRTDETRTransformerDecoder
+from .rotated_rtdetr_ld import RotatedRTDETRKD, RotatedRTDETRLDHead
 
 __all__ = [
     'ResNetV1dPaddle',
@@ -15,4 +16,7 @@ __all__ = [
     'RTDETRVarifocalLoss',
     'DEIMMalLoss',
     'RotatedRTDETRHead',
-    'RotatedRTDETRTransformerDecoder']
+    'RotatedRTDETRTransformerDecoder',
+    'Integral',
+    'RotatedRTDETRKD',
+    'RotatedRTDETRLDHead']

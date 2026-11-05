@@ -164,6 +164,28 @@ python demo/image_demo.py \
     --out-file /root/demo_result.jpg
 ```
 
+## Localization Distillation (Rotated-LD)
+
+Teacher -> student distillation adapted from [Rotated-LD](https://github.com/Zzh-tju/Rotated-LD) (Localization Distillation for Object Detection, CVPR 2022 / TPAMI 2023): `loss_ld` distills the box localization and `loss_kd` the classification logits (both KL divergence with temperature `T`) in the valuable localization region. See `rotated_rtdetr/rotated_rtdetr_ld.py`.
+
+Since RT-DETR has no anchor grid shared by teacher and student, the queries are put in 1-to-1 correspondence: the denoising queries (noisy GT boxes and labels) are generated once and fed to both models, and the teacher takes its matching queries from the encoder positions selected by the student. Valuable localization region: positive denoising queries (LD) / all denoising queries (KD), and the matching queries whose teacher box has rotated IoU >= `vlr_iou_thr` with a GT.
+
+**Distribution LD** (as in Rotated-LD): teacher and student regress every box coordinate as a general distribution (`reg_max`). Train the distribution-kind teacher first, then the student:
+
+```bash
+bash tools/dist_train.sh projects/rotated_rtdetr/configs/o2_rtdetr_r50vd_dist_2xb4_72e_dota.py 2
+# set teacher_ckpt in the config, then
+bash tools/dist_train.sh projects/rotated_rtdetr/configs/o2_rtdetr_r18vd_ld_r50vd_dist_2xb4_72e_dota.py 2
+```
+
+**Gaussian LD**: works with a regular teacher such as the released O2-RTDETR R50vd checkpoint. The boxes are modeled as 2-D Gaussians and the student is pulled to the teacher boxes with the KLD (`GDLoss`):
+
+```bash
+bash tools/dist_train.sh projects/rotated_rtdetr/configs/o2_rtdetr_r18vd_ld_gauss_r50vd_2xb4_72e_dota.py 2
+```
+
+The trained student is a plain O2-RTDETR (the teacher is not saved in the checkpoint): test it with the student architecture config, `o2_rtdetr_r18vd_2xb4_72e_dota.py` (Gaussian LD) or `o2_rtdetr_r18vd_dist_2xb4_72e_dota.py` (distribution LD), so the teacher is not built.
+
 ## Class Activation Maps (Grad-CAM)
 
 Based on the [pytorch-grad-cam object detection tutorial](https://jacobgil.github.io/pytorch-gradcam-book/Class%20Activation%20Maps%20for%20Object%20Detection%20With%20Faster%20RCNN.html) (`pip install grad-cam`).

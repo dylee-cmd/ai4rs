@@ -43,6 +43,12 @@ class RotatedRTDETR(RotatedDINO):
             self.proposals, self.proposals_valid = None, None
 
         # TODO: Waiting for mmengine support
+        # Set by a distillation wrapper (RotatedRTDETRKD) around one forward:
+        # 'dn': precomputed denoising queries shared by teacher and student,
+        # 'topk_indices': encoder positions to take the matching queries
+        # from. pre_decoder writes the 'topk_indices' it used back into it.
+        self.distill_ctx: Optional[dict] = None
+
         if use_syncbn and get_world_size() > 1:
             torch.nn.SyncBatchNorm.convert_sync_batchnorm(self)
             print_log('Using SyncBatchNorm()', 'current')
@@ -203,8 +209,14 @@ class RotatedRTDETR(RotatedDINO):
         # multi-class classification, while DeformDETR, where the input
         # is `enc_outputs_class[..., 0]` selects according to scores of
         # binary classification.
-        topk_indices = torch.topk(
-            enc_outputs_class.max(-1)[0], k=self.num_queries, dim=1)[1]
+        ctx = self.distill_ctx
+        if ctx is not None and ctx.get('topk_indices') is not None:
+            topk_indices = ctx['topk_indices']
+        else:
+            topk_indices = torch.topk(
+                enc_outputs_class.max(-1)[0], k=self.num_queries, dim=1)[1]
+        if ctx is not None:
+            ctx['topk_indices'] = topk_indices
 
         query = torch.gather(output_memory, 1,
                              topk_indices.unsqueeze(-1).repeat(1, 1, c))
@@ -214,16 +226,23 @@ class RotatedRTDETR(RotatedDINO):
         topk_coords_unact = self.bbox_head.reg_branches[
             self.decoder.num_layers](query) + topk_output_proposals
 
-        if self.training:
-            topk_score = torch.gather(
-                enc_outputs_class, 1,
-                topk_indices.unsqueeze(-1).repeat(1, 1, cls_out_features))
-            topk_coords = topk_coords_unact.sigmoid()
-            topk_coords_unact = topk_coords_unact.detach()
+        # A teacher in eval mode still takes the (shared) denoising queries
+        # during distillation.
+        shared_dn = ctx.get('dn') if ctx is not None else None
+        if self.training or shared_dn is not None:
+            if self.training:
+                topk_score = torch.gather(
+                    enc_outputs_class, 1,
+                    topk_indices.unsqueeze(-1).repeat(1, 1, cls_out_features))
+                topk_coords = topk_coords_unact.sigmoid()
+                topk_coords_unact = topk_coords_unact.detach()
+                query = query.detach()  # detach() is not used in DINO
 
-            dn_label_query, dn_bbox_query, dn_mask, dn_meta = \
-                self.dn_query_generator(batch_data_samples)
-            query = query.detach()  # detach() is not used in DINO
+            if shared_dn is not None:
+                dn_label_query, dn_bbox_query, dn_mask, dn_meta = shared_dn
+            else:
+                dn_label_query, dn_bbox_query, dn_mask, dn_meta = \
+                    self.dn_query_generator(batch_data_samples)
             query = torch.cat([dn_label_query, query], dim=1)
             dn_bbox_query = dn_bbox_query.type_as(topk_coords_unact)
             reference_points = torch.cat([dn_bbox_query, topk_coords_unact],
@@ -243,10 +262,13 @@ class RotatedRTDETR(RotatedDINO):
         # NOTE DINO calculates encoder losses on scores and coordinates
         # of selected top-k encoder queries, while DeformDETR is of all
         # encoder queries.
-        head_inputs_dict = dict(
-            enc_outputs_class=topk_score,
-            enc_outputs_coord=topk_coords,
-            dn_meta=dn_meta) if self.training else dict()
+        if self.training:
+            head_inputs_dict = dict(
+                enc_outputs_class=topk_score,
+                enc_outputs_coord=topk_coords,
+                dn_meta=dn_meta)
+        else:
+            head_inputs_dict = dict()
         return decoder_inputs_dict, head_inputs_dict
 
     def gen_encoder_output_proposals(

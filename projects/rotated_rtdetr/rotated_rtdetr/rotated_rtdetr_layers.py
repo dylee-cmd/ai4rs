@@ -2,6 +2,7 @@ from typing import Tuple
 from torch import Tensor, nn
 from mmdet.models.layers.transformer import inverse_sigmoid
 from projects.rotated_dino.rotated_dino import RotatedDinoTransformerDecoder
+from .rotated_rtdetr_head import Integral
 from .utils import MLP
 
 
@@ -74,6 +75,9 @@ class RotatedRTDETRTransformerDecoder(RotatedDinoTransformerDecoder):
         hidden_states = []
         all_layers_outputs_classes = []
         all_layers_outputs_coords = []
+        # only for distribution regression heads (localization distillation)
+        all_layers_outputs_dists = []
+        all_layers_references = []
         for lid, layer in enumerate(self.layers):
             num_levels = layer.cross_attn_cfg.num_levels
             reference_points_input = reference_points.unsqueeze(2).repeat(1, 1, num_levels, 1)
@@ -92,13 +96,23 @@ class RotatedRTDETRTransformerDecoder(RotatedDinoTransformerDecoder):
                 reference_points=reference_points_input,
                 **kwargs)
 
-            tmp = reg_branches[lid](query)
+            reg_branch = reg_branches[lid]
+            if isinstance(reg_branch[-1], Integral):
+                dist = reg_branch[:-1](query)
+                tmp = reg_branch[-1](dist)
+            else:
+                dist = None
+                tmp = reg_branch(query)
 
             if self.training or lid == eval_idx:
                 hidden_states.append(query)
                 all_layers_outputs_classes.append(cls_branches[lid](query))
                 all_layers_outputs_coords.append(
                     (tmp + inverse_sigmoid(reference_points, eps=1e-3)).sigmoid())
+                if dist is not None:
+                    all_layers_outputs_dists.append(dist)
+                    all_layers_references.append(
+                        inverse_sigmoid(reference_points, eps=1e-3))
 
                 if not self.training or lid == self.num_layers - 1:
                     break
@@ -106,4 +120,8 @@ class RotatedRTDETRTransformerDecoder(RotatedDinoTransformerDecoder):
             unact_reference_points = tmp + inverse_sigmoid(reference_points, eps=1e-3).detach()
             reference_points = unact_reference_points.sigmoid().detach()
 
-        return hidden_states, (all_layers_outputs_classes, all_layers_outputs_coords)
+        references = (all_layers_outputs_classes, all_layers_outputs_coords)
+        if all_layers_outputs_dists:
+            # (unactivated) reference points the distributions are relative to
+            references += (all_layers_outputs_dists, all_layers_references)
+        return hidden_states, references

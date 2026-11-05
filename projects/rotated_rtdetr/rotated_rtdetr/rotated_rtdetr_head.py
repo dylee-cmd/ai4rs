@@ -1,6 +1,8 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import torch
-from torch import Tensor
+from torch import Tensor, nn
+from mmcv.cnn import Linear
+from mmengine.model import bias_init_with_prob, constant_init
 from mmengine.structures import InstanceData
 from mmcv.ops import batched_nms
 from mmdet.utils import InstanceList, reduce_mean
@@ -12,6 +14,39 @@ from .prob_iou import probiou
 from .utils import cast_tensors_to_float, disable_autocast, find_device_type
 
 
+class Integral(nn.Module):
+    """Expectation of a general distribution, as in GFL and Rotated-LD.
+
+    Every one of the ``num_coords`` regression outputs is predicted as a
+    discrete distribution over ``reg_max + 1`` bins evenly spaced in
+    ``[-reg_range, reg_range]``. The output is its expectation, i.e. the same
+    unactivated (inverse-sigmoid space) box delta a plain linear layer would
+    predict.
+
+    Args:
+        reg_max (int): Number of bins minus one.
+        reg_range (float): Half width of the value range of the bins.
+        num_coords (int): Number of regressed coordinates. Defaults to 5
+            (cx, cy, w, h, angle).
+    """
+
+    def __init__(self, reg_max: int, reg_range: float,
+                 num_coords: int = 5) -> None:
+        super().__init__()
+        self.reg_max = reg_max
+        self.reg_range = reg_range
+        self.num_coords = num_coords
+        self.register_buffer(
+            'project', torch.linspace(-reg_range, reg_range, reg_max + 1),
+            persistent=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """(..., num_coords * (reg_max + 1)) logits -> (..., num_coords)."""
+        x = x.reshape(*x.shape[:-1], self.num_coords, self.reg_max + 1)
+        prob = x.softmax(-1)
+        return (prob * self.project.to(prob.dtype)).sum(-1)
+
+
 class RotatedRTDETRHead(RotatedDINOHead):
     r"""Head of the DETRs Beat YOLOs on Real-time Object Detection
 
@@ -20,12 +55,53 @@ class RotatedRTDETRHead(RotatedDINOHead):
 
     More details can be found in the `paper
     <https://arxiv.org/abs/2304.08069>`_ .
+
+    Args:
+        reg_max (int, optional): If set, the box regression branches predict
+            a general distribution with ``reg_max + 1`` bins per coordinate
+            instead of a single value (see :class:`Integral`). This is the
+            "distribution kind" model required as teacher (and student) of
+            distribution localization distillation (Rotated-LD). Defaults to
+            None, i.e. plain regression.
+        reg_range (float): Value range of the distribution bins,
+            ``[-reg_range, reg_range]`` in inverse-sigmoid space. Only used
+            with ``reg_max``. Defaults to 8.
     """
     def __init__(self,
                  *args,
+                 reg_max: Optional[int] = None,
+                 reg_range: float = 8.0,
                  **kwargs):
         self.varifocal_loss_iou_type = kwargs['loss_cls'].pop('varifocal_loss_iou_type')
+        self.reg_max = reg_max
+        self.reg_range = reg_range
         super(RotatedRTDETRHead, self).__init__(*args, **kwargs)
+
+    def _init_layers(self) -> None:
+        super()._init_layers()
+        if self.reg_max is None:
+            return
+        branches = []
+        for branch in self.reg_branches:
+            layers = list(branch)[:-1] + [
+                Linear(self.embed_dims, self.reg_dim * (self.reg_max + 1)),
+                Integral(self.reg_max, self.reg_range, self.reg_dim)
+            ]
+            branches.append(nn.Sequential(*layers))
+        self.reg_branches = nn.ModuleList(branches)
+
+    def init_weights(self) -> None:
+        if self.reg_max is None:
+            return super().init_weights()
+        # Same as DeformableDETRHead.init_weights (two stage): zero output
+        # logits, i.e. a uniform distribution whose expectation is 0.
+        if self.loss_cls.use_sigmoid:
+            bias_init = bias_init_with_prob(0.01)
+            for m in self.cls_branches:
+                if hasattr(m, 'bias') and m.bias is not None:
+                    nn.init.constant_(m.bias, bias_init)
+        for m in self.reg_branches:
+            constant_init(m[-2], 0, bias=0)
 
     def forward(self, hidden_states: List[Tuple[int, Tensor]],
                 references: Tuple[List[Tensor], List[Tensor]]) -> Tuple[List[Tensor], List[Tensor]]:
@@ -54,7 +130,10 @@ class RotatedRTDETRHead(RotatedDINOHead):
               h), has shape (num_decoder_layers, bs, num_queries, 4) with the
               last dimension arranged as (cx, cy, w, h).
         """
-        return tuple(references)
+        # references may also carry the regression distributions and the
+        # reference points of every layer (distribution heads), which are
+        # only used by localization distillation.
+        return tuple(references[:2])
 
     def loss_by_feat(self, *args, **kwargs) -> Dict[str, Tensor]:
         """Loss function, always computed in float32 with autocast disabled.
