@@ -410,3 +410,64 @@ class GDLoss(nn.Module):
             reduction=reduction,
             **_kwargs) * self.loss_weight
 
+
+
+def inflate_rbox(bboxes, psf_std):
+    """Add an isotropic PSF floor to rotated boxes.
+
+    ``xy_wh_r_2_xy_sigma`` maps a box to Sigma = R diag(w^2/4, h^2/4) R^T, so
+    adding an isotropic PSF variance s^2 (Sigma + s^2 I) is the same as
+    growing w and h to sqrt(w^2 + 4 s^2) and sqrt(h^2 + 4 s^2).
+
+    Args:
+        bboxes (torch.Tensor): (..., 5) boxes (x, y, w, h, angle).
+        psf_std (float): PSF standard deviation s, in the units of the box
+            coordinates (pixels for unnormalized boxes; ``s_px / input_size``
+            for boxes normalized to [0, 1]).
+
+    Returns:
+        torch.Tensor: Inflated boxes, same shape.
+    """
+    if psf_std == 0:
+        # sqrt(w^2) has an infinite gradient at w = 0
+        return bboxes
+    pad = (2 * psf_std)**2
+    w = (bboxes[..., 2]**2 + pad).sqrt()
+    h = (bboxes[..., 3]**2 + pad).sqrt()
+    return torch.stack([bboxes[..., 0], bboxes[..., 1], w, h, bboxes[..., 4]],
+                       dim=-1)
+
+
+@MODELS.register_module()
+class PSFGDLoss(GDLoss):
+    """Gaussian based loss (e.g. KLD) with an isotropic PSF floor.
+
+    Both boxes are inflated with :func:`inflate_rbox` before the Gaussian
+    distance, i.e. Sigma + s^2 I. For small targets a sub-PSF offset or size
+    error then no longer dominates the loss. ``psf_std=0`` is exactly
+    :class:`GDLoss`. Use the same ``psf_std`` in the matching cost
+    (``PSFGDCost``), otherwise matching and training disagree.
+
+    The distance is computed in float32 with autocast disabled: with
+    pixel-scale boxes Sigma overflows fp16, and autocast would run ``bmm`` in
+    half precision even for float32 inputs.
+
+    Args:
+        psf_std (float): PSF standard deviation in the units of the boxes
+            (pixels for the unnormalized boxes of the rotated DETR heads).
+            Defaults to 0.
+        **kwargs: Arguments of :class:`GDLoss`.
+    """
+
+    def __init__(self, psf_std=0.0, **kwargs):
+        super(PSFGDLoss, self).__init__(**kwargs)
+        assert psf_std >= 0
+        assert self.preprocess is xy_wh_r_2_xy_sigma, \
+            "PSFGDLoss needs representation='xy_wh_r'"
+        self.psf_std = psf_std
+
+    def forward(self, pred, target, *args, **kwargs):
+        with torch.autocast(device_type=pred.device.type, enabled=False):
+            return super(PSFGDLoss, self).forward(
+                inflate_rbox(pred.float(), self.psf_std),
+                inflate_rbox(target.float(), self.psf_std), *args, **kwargs)

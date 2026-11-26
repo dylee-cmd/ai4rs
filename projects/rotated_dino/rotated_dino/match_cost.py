@@ -8,7 +8,8 @@ from mmcv.ops.diff_iou_rotated import box2corners
 from mmdet.models.task_modules.assigners.match_cost import BaseMatchCost, BBoxL1Cost
 from mmdet.structures.bbox import BaseBoxes
 from mmrotate.models.losses.gaussian_dist_loss import (
-    postprocess, xy_stddev_pearson_2_xy_sigma, xy_wh_r_2_xy_sigma)
+    inflate_rbox, postprocess, xy_stddev_pearson_2_xy_sigma,
+    xy_wh_r_2_xy_sigma)
 from mmrotate.structures.bbox import rbbox_overlaps
 
 
@@ -312,6 +313,49 @@ class GDCost(BaseMatchCost):
             tau=self.tau,
             alpha=self.alpha,
             **_kwargs) * self.weight
+
+
+class PSFGDCost(GDCost):
+    """GDCost (e.g. KLD) with an isotropic PSF floor, the matching
+    counterpart of :class:`mmrotate.models.losses.PSFGDLoss`.
+
+    Both boxes are inflated with :func:`inflate_rbox` (Sigma + s^2 I) before
+    the Gaussian distance. Use the same ``psf_std`` as the loss so that the
+    matching and the training target agree. Computed in float32 with
+    autocast disabled.
+
+    Args:
+        psf_std (float): PSF standard deviation in the units of the boxes
+            (pixels: the matching costs get unnormalized boxes). Defaults
+            to 0, i.e. :class:`GDCost`.
+        **kwargs: Arguments of :class:`GDCost`.
+    """
+
+    def __init__(self, psf_std: float = 0.0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        assert psf_std >= 0
+        assert self.preprocess is xy_wh_r_2_xy_sigma, \
+            "PSFGDCost needs representation='xy_wh_r'"
+        self.psf_std = psf_std
+
+    @torch.no_grad()
+    def __call__(self,
+                 pred_instances: InstanceData,
+                 gt_instances: InstanceData,
+                 img_meta: Optional[dict] = None,
+                 **kwargs):
+        gt_bboxes = gt_instances.bboxes
+        if isinstance(gt_bboxes, BaseBoxes):
+            gt_bboxes = gt_bboxes.tensor
+        pred_bboxes = pred_instances.bboxes
+        with torch.autocast(device_type=pred_bboxes.device.type,
+                            enabled=False):
+            return super().__call__(
+                InstanceData(bboxes=inflate_rbox(pred_bboxes.float(),
+                                                 self.psf_std)),
+                InstanceData(bboxes=inflate_rbox(gt_bboxes.float(),
+                                                 self.psf_std)),
+                img_meta=img_meta, **kwargs)
 
 
 class HausdorffCost(RBoxL1Cost):
